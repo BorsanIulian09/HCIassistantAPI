@@ -1,19 +1,82 @@
-
 using Microsoft.AspNetCore.Mvc;
-using HCI.AIAssistant.API.models.DTOs.AIAssistantController;
+
+using HCI.AIAssistant.API.Models.DTOs.AIAssistantController;
+using HCI.AIAssistant.API.Services;
+using HCI.AIAssistant.API.Models.DTOs;
+using Newtonsoft.Json;
+using Microsoft.Azure.Devices;
+using System.Text;
+
 namespace HCI.AIAssistant.API.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
 public class AIAssistantController : ControllerBase
 {
-    [HttpPost("/message")]
- public async Task<ActionResult<AIAssistantControllerPostMessageResponseDTO>> PostMessageAsync(AIAssistantControllerPostMessageRequestDTO request)
+    private readonly ISecretsService _secretsService;
+    private readonly IAppConfigurationsService _appConfigurationsService;
+    private readonly IAIAssistantService _aIAssistantService;
+    private readonly IParametricFunctions _parametricFunctions;
+
+    public AIAssistantController(
+        ISecretsService secretsService,
+        IAppConfigurationsService appConfigurationsService,
+        IAIAssistantService aIAssistantService,
+        IParametricFunctions parametricFunctions
+    )
     {
-        // Simulate some processing delay
-        AIAssistantControllerPostMessageResponseDTO response = new (){
-            TextMessage = "Echo: " + request.TextMessage
+        _secretsService = secretsService;
+        _appConfigurationsService = appConfigurationsService;
+        _aIAssistantService = aIAssistantService;
+        _parametricFunctions = parametricFunctions;
+    }
+
+    [HttpPost("message")]
+    [ProducesResponseType(typeof(AIAssistantControllerPostMessageResponseDTO), 200)]
+    [ProducesResponseType(typeof(ErrorResponseDTO), 400)]
+    public async Task<ActionResult> PostMessage([FromBody] AIAssistantControllerPostMessageRequestDTO request)
+    {
+        if (!_parametricFunctions.ObjectExistsAndHasNoNullPublicProperties(request))
+        {
+            return BadRequest(
+                new ErrorResponseDTO()
+                {
+                    TextErrorTitle = "AtLeastOneNullParameter",
+                    TextErrorMessage = "Some parameters are null/missing.",
+                    TextErrorTrace = _parametricFunctions.GetCallerTrace()
+                }
+            );
+        }
+        string messageToSendToAssistant = "Instruction: " + _appConfigurationsService.Instruction + "\nMessage: " + request.TextMessage;
+         string textMessageResponse = await _aIAssistantService.SendMessageAndGetResponseAsync(messageToSendToAssistant);
+
+#pragma warning disable CS8604
+        
+#pragma warning restore CS8604
+
+        AIAssistantControllerPostMessageResponseDTO response = new()
+        {
+            TextMessage = textMessageResponse
         };
+
+        string? ioTHubConnectionString = _secretsService?.IoTHubSecrets?.ConnectionString;
+        if (!string.IsNullOrWhiteSpace(ioTHubConnectionString))
+        {
+            try
+            {
+                var serviceClientForIoTHub = ServiceClient.CreateFromConnectionString(ioTHubConnectionString);
+                var seralizedMessage = JsonConvert.SerializeObject(textMessageResponse);
+
+                var ioTMessage = new Message(Encoding.UTF8.GetBytes(seralizedMessage));
+                await serviceClientForIoTHub.SendAsync(_appConfigurationsService.IoTDeviceName, ioTMessage);
+            }
+            catch (FormatException)
+            {
+                // Invalid IoT Hub connection string - skip sending to IoT Hub
+                Console.WriteLine("Warning: IoT Hub connection string is malformed. Message not sent to IoT device.");
+            }
+        }
+
         return Ok(response);
     }
 }
